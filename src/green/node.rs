@@ -2,7 +2,7 @@ use std::{
     borrow::{Borrow, Cow},
     fmt,
     iter::{self, FusedIterator},
-    mem::{self, ManuallyDrop},
+    mem::ManuallyDrop,
     ops, ptr, slice,
 };
 
@@ -10,7 +10,7 @@ use countme::Count;
 
 use crate::{
     GreenToken, NodeOrToken, TextRange, TextSize,
-    arc::{Arc, HeaderSlice, ThinArc},
+    arc::{Arc, ArcInner, HeaderSlice, ThinArc},
     green::{GreenElement, GreenElementRef, SyntaxKind},
 };
 
@@ -28,11 +28,14 @@ pub(crate) enum GreenChild {
     Token { rel_offset: TextSize, token: GreenToken },
 }
 
-type Repr = HeaderSlice<GreenNodeHead, [GreenChild]>;
 type ReprThin = HeaderSlice<GreenNodeHead, [GreenChild; 0]>;
+/// Thin, unsized-erased view of a [`GreenNode`]'s backing allocation.
+///
+/// `#[repr(transparent)]` over the whole [`ArcInner`], so a `&GreenNodeData`
+/// covers the interior-mutable `count` and can bump or drop the refcount.
 #[repr(transparent)]
 pub struct GreenNodeData {
-    data: ReprThin,
+    inner: ArcInner<ReprThin>,
 }
 
 impl PartialEq for GreenNodeData {
@@ -110,12 +113,12 @@ impl fmt::Display for GreenNodeData {
 impl GreenNodeData {
     #[inline]
     fn header(&self) -> &GreenNodeHead {
-        &self.data.header
+        &self.inner.data.header
     }
 
     #[inline]
     fn slice(&self) -> &[GreenChild] {
-        self.data.slice()
+        self.inner.data.slice()
     }
 
     /// Kind of this node.
@@ -186,11 +189,8 @@ impl ops::Deref for GreenNode {
 
     #[inline]
     fn deref(&self) -> &GreenNodeData {
-        let repr: &Repr = &self.ptr;
-        unsafe {
-            let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
-            mem::transmute::<&ReprThin, &GreenNodeData>(repr)
-        }
+        // Transparent over `ArcInner<ReprThin>`; `as_ptr` keeps whole-allocation provenance.
+        unsafe { &*(self.ptr.as_ptr() as *const GreenNodeData) }
     }
 }
 
@@ -230,18 +230,14 @@ impl GreenNode {
 
     #[inline]
     pub(crate) fn into_raw(this: GreenNode) -> ptr::NonNull<GreenNodeData> {
-        let green = ManuallyDrop::new(this);
-        let green: &GreenNodeData = &green;
-        ptr::NonNull::from(green)
+        this.ptr.into_raw_inner().cast()
     }
 
     #[inline]
     pub(crate) unsafe fn from_raw(ptr: ptr::NonNull<GreenNodeData>) -> GreenNode {
-        unsafe {
-            let arc = Arc::from_raw(&ptr.as_ref().data as *const ReprThin);
-            let arc = mem::transmute::<Arc<ReprThin>, ThinArc<GreenNodeHead, GreenChild>>(arc);
-            GreenNode { ptr: arc }
-        }
+        // `ptr` points at the `ArcInner` (see `into_raw`).
+        let arc = unsafe { ThinArc::from_raw_inner(ptr.cast()) };
+        GreenNode { ptr: arc }
     }
 }
 

@@ -44,24 +44,6 @@ pub(crate) struct Arc<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for Arc<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Arc<T> {}
 
-impl<T> Arc<T> {
-    /// Reconstruct the Arc<T> from a raw pointer obtained from into_raw()
-    ///
-    /// Note: This raw pointer will be offset in the allocation and must be preceded
-    /// by the atomic count.
-    ///
-    /// It is recommended to use OffsetArc for this
-    #[inline]
-    pub(crate) unsafe fn from_raw(ptr: *const T) -> Self {
-        // To find the corresponding pointer to the `ArcInner` we need
-        // to subtract the offset of the `data` field from the pointer.
-        unsafe {
-            let ptr = (ptr as *const u8).sub(offset_of!(ArcInner<T>, data));
-            Arc { p: ptr::NonNull::new_unchecked(ptr as *mut ArcInner<T>), phantom: PhantomData }
-        }
-    }
-}
-
 impl<T: ?Sized> Arc<T> {
     #[inline]
     fn inner(&self) -> &ArcInner<T> {
@@ -387,6 +369,33 @@ impl<H, T> ThinArc<H, T> {
         }
 
         ThinArc { ptr: unsafe { ptr::NonNull::new_unchecked(ptr) }, phantom: PhantomData }
+    }
+
+    /// Raw pointer to the backing `ArcInner`, borrowing `self`; does not change
+    /// the refcount. Non-consuming counterpart of [`ThinArc::into_raw_inner`].
+    #[inline]
+    pub(crate) fn as_ptr(&self) -> *mut ArcInner<HeaderSlice<H, [T; 0]>> {
+        self.ptr.as_ptr()
+    }
+
+    /// Consumes the `ThinArc` into a raw `ArcInner` pointer without changing the
+    /// refcount (triomphe's `Arc::into_raw_inner`).
+    #[inline]
+    pub(crate) fn into_raw_inner(self) -> ptr::NonNull<ArcInner<HeaderSlice<H, [T; 0]>>> {
+        ManuallyDrop::new(self).ptr
+    }
+
+    /// Rebuilds a `ThinArc` from an `ArcInner` pointer (triomphe's
+    /// `Arc::from_raw_inner`); does not change the refcount.
+    ///
+    /// # Safety
+    ///
+    /// `ptr` must own a live allocation originally produced by a `ThinArc<H, T>`.
+    #[inline]
+    pub(crate) unsafe fn from_raw_inner(
+        ptr: ptr::NonNull<ArcInner<HeaderSlice<H, [T; 0]>>>,
+    ) -> Self {
+        ThinArc { ptr, phantom: PhantomData }
     }
 }
 

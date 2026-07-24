@@ -1,15 +1,10 @@
-use std::{
-    borrow::Borrow,
-    fmt,
-    mem::{self, ManuallyDrop},
-    ops, ptr,
-};
+use std::{borrow::Borrow, fmt, mem::ManuallyDrop, ops, ptr};
 
 use countme::Count;
 
 use crate::{
     TextSize,
-    arc::{Arc, HeaderSlice, ThinArc},
+    arc::{ArcInner, HeaderSlice, ThinArc},
     green::SyntaxKind,
 };
 
@@ -19,11 +14,14 @@ struct GreenTokenHead {
     _c: Count<GreenToken>,
 }
 
-type Repr = HeaderSlice<GreenTokenHead, [u8]>;
 type ReprThin = HeaderSlice<GreenTokenHead, [u8; 0]>;
+/// Thin, unsized-erased view of a [`GreenToken`]'s backing allocation.
+///
+/// Like [`super::node::GreenNodeData`], `#[repr(transparent)]` over the whole
+/// [`ArcInner`], so a `&GreenTokenData` covers the interior-mutable `count`.
 #[repr(transparent)]
 pub struct GreenTokenData {
-    data: ReprThin,
+    inner: ArcInner<ReprThin>,
 }
 
 impl PartialEq for GreenTokenData {
@@ -90,13 +88,13 @@ impl GreenTokenData {
     /// Kind of this Token.
     #[inline]
     pub fn kind(&self) -> SyntaxKind {
-        self.data.header.kind
+        self.inner.data.header.kind
     }
 
     /// Text of this Token.
     #[inline]
     pub fn text(&self) -> &str {
-        unsafe { std::str::from_utf8_unchecked(self.data.slice()) }
+        unsafe { std::str::from_utf8_unchecked(self.inner.data.slice()) }
     }
 
     /// Returns the length of the text covered by this token.
@@ -116,26 +114,16 @@ impl GreenToken {
     }
     #[inline]
     pub(crate) fn into_raw(this: GreenToken) -> ptr::NonNull<GreenTokenData> {
-        let green = ManuallyDrop::new(this);
-        let green: &GreenTokenData = &green;
-        ptr::NonNull::from(green)
+        this.ptr.into_raw_inner().cast()
     }
 
     /// # Safety
     ///
-    /// This function uses `unsafe` code to create an `Arc` from a raw pointer and then transmutes it into a `ThinArc`.
-    ///
-    /// - The raw pointer must be valid and correctly aligned for the type `ReprThin`.
-    /// - The lifetime of the raw pointer must outlive the lifetime of the `Arc` created from it.
-    /// - The transmute operation must be safe, meaning that the memory layout of `Arc<ReprThin>` must be compatible with `ThinArc<GreenTokenHead, u8>`.
-    ///
-    /// Failure to uphold these invariants can lead to undefined behavior.
+    /// `ptr` must point at the `ArcInner` backing a `GreenToken` (as produced by
+    /// [`GreenToken::into_raw`]); ownership is transferred into the return value.
     #[inline]
     pub(crate) unsafe fn from_raw(ptr: ptr::NonNull<GreenTokenData>) -> GreenToken {
-        let arc = unsafe {
-            let arc = Arc::from_raw(&ptr.as_ref().data as *const ReprThin);
-            mem::transmute::<Arc<ReprThin>, ThinArc<GreenTokenHead, u8>>(arc)
-        };
+        let arc = unsafe { ThinArc::from_raw_inner(ptr.cast()) };
         GreenToken { ptr: arc }
     }
 }
@@ -145,10 +133,7 @@ impl ops::Deref for GreenToken {
 
     #[inline]
     fn deref(&self) -> &GreenTokenData {
-        unsafe {
-            let repr: &Repr = &self.ptr;
-            let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
-            mem::transmute::<&ReprThin, &GreenTokenData>(repr)
-        }
+        // See `GreenNode::deref`.
+        unsafe { &*(self.ptr.as_ptr() as *const GreenTokenData) }
     }
 }

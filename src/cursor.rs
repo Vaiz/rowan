@@ -87,7 +87,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     iter,
-    mem::{self, ManuallyDrop},
+    mem::ManuallyDrop,
     ops::Range,
     ptr, slice,
 };
@@ -311,7 +311,9 @@ impl NodeData {
         let parent = self.parent()?;
         debug_assert!(matches!(parent.green, Green::Node { .. }));
         parent.inc_rc();
-        Some(SyntaxNode { ptr: ptr::NonNull::from(parent) })
+        // `NonNull::from(parent)` would narrow provenance and make `free`'s
+        // `Box::from_raw` UB; take the raw pointer from the cell instead.
+        Some(SyntaxNode { ptr: self.parent.get().unwrap() })
     }
 
     #[inline]
@@ -539,7 +541,10 @@ impl NodeData {
                         _ => unreachable!(),
                     },
                     None => {
-                        mem::forget(new_green);
+                        // `node` is the root and owns `new_green`; store it via
+                        // `into_raw` so the pointer keeps whole-allocation provenance.
+                        let Green::Node { ptr } = &node.green else { unreachable!() };
+                        ptr.set(GreenNode::into_raw(new_green));
                         let _ = GreenNode::from_raw(old_green);
                         break;
                     }
@@ -584,7 +589,15 @@ impl SyntaxNode {
                 let parent = parent.clone_for_update();
                 SyntaxNode::new_child(self.green_ref(), parent, self.data().index(), self.offset())
             }
-            None => SyntaxNode::new_root_mut(self.green_ref().to_owned()),
+            None => {
+                // A root owns its green; rebuild it from the stored writable
+                // pointer rather than `green_ref().to_owned()`.
+                let Green::Node { ptr } = &self.data().green else {
+                    unreachable!("a root is always a node")
+                };
+                let green = ManuallyDrop::new(unsafe { GreenNode::from_raw(ptr.get()) });
+                SyntaxNode::new_root_mut(GreenNode::clone(&green))
+            }
         }
     }
 
