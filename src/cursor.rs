@@ -87,7 +87,7 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     iter,
-    mem::{self, ManuallyDrop},
+    mem::ManuallyDrop,
     ops::Range,
     ptr, slice,
 };
@@ -311,7 +311,10 @@ impl NodeData {
         let parent = self.parent()?;
         debug_assert!(matches!(parent.green, Green::Node { .. }));
         parent.inc_rc();
-        Some(SyntaxNode { ptr: ptr::NonNull::from(parent) })
+        // Use the raw `NodeData` pointer stored in the cell, which keeps
+        // whole-allocation provenance. `NonNull::from(parent)` would narrow it to
+        // a shared borrow and make `free`'s `Box::from_raw` deallocation UB.
+        Some(SyntaxNode { ptr: self.parent.get().unwrap() })
     }
 
     #[inline]
@@ -466,13 +469,19 @@ impl NodeData {
         let parent = unsafe { parent_ptr.as_ref() };
         sll::unlink(&parent.first, self);
 
-        // Add strong ref to green
-        match self.green().to_owned() {
-            NodeOrToken::Node(it) => {
-                GreenNode::into_raw(it);
+        // Add a strong ref to the *shared* green this node points at (it becomes
+        // a root and must own a reference). `self.green().to_owned()` now returns
+        // an independent deep copy, so it would leave the stored green's refcount
+        // un-bumped; reconstruct the owned green from the stored whole-allocation
+        // pointer and clone that instead.
+        match &self.green {
+            Green::Node { ptr } => {
+                let green = ManuallyDrop::new(unsafe { GreenNode::from_raw(ptr.get()) });
+                GreenNode::into_raw(GreenNode::clone(&green));
             }
-            NodeOrToken::Token(it) => {
-                GreenToken::into_raw(it);
+            Green::Token { ptr } => {
+                let green = ManuallyDrop::new(unsafe { GreenToken::from_raw(*ptr) });
+                GreenToken::into_raw(GreenToken::clone(&green));
             }
         }
 
@@ -539,7 +548,11 @@ impl NodeData {
                         _ => unreachable!(),
                     },
                     None => {
-                        mem::forget(new_green);
+                        // `node` is the root and owns `new_green`; store it via
+                        // `into_raw` so the pointer keeps whole-allocation
+                        // provenance, then release the previous green.
+                        let Green::Node { ptr } = &node.green else { unreachable!() };
+                        ptr.set(GreenNode::into_raw(new_green));
                         let _ = GreenNode::from_raw(old_green);
                         break;
                     }

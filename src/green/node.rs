@@ -1,16 +1,17 @@
 use std::{
     borrow::{Borrow, Cow},
+    ffi::c_void,
     fmt,
     iter::{self, FusedIterator},
-    mem::{self, ManuallyDrop},
     ops, ptr, slice,
+    sync::atomic::AtomicUsize,
 };
 
 use countme::Count;
+use triomphe::{HeaderSlice, HeaderWithLength, ThinArc};
 
 use crate::{
     GreenToken, NodeOrToken, TextRange, TextSize,
-    arc::{Arc, HeaderSlice, ThinArc},
     green::{GreenElement, GreenElementRef, SyntaxKind},
 };
 
@@ -28,10 +29,19 @@ pub(crate) enum GreenChild {
     Token { rel_offset: TextSize, token: GreenToken },
 }
 
-type Repr = HeaderSlice<GreenNodeHead, [GreenChild]>;
-type ReprThin = HeaderSlice<GreenNodeHead, [GreenChild; 0]>;
-#[repr(transparent)]
+type ReprThin = HeaderSlice<HeaderWithLength<GreenNodeHead>, [GreenChild; 0]>;
+/// Borrowed view of a [`GreenNode`]'s backing allocation.
+///
+/// Laid out to mirror triomphe's private `ArcInner<ReprThin>` — a `#[repr(C)]`
+/// struct whose leading field is the atomic strong count — so that a
+/// `&GreenNodeData` addresses the *whole* allocation and every read is
+/// in-provenance. We never touch `strong` ourselves: all refcount changes and
+/// deallocation go through triomphe's [`ThinArc`], which keeps whole-allocation
+/// provenance (unlike a payload-only `&GreenNodeData`, which would make the
+/// refcount write UB under Tree Borrows).
+#[repr(C)]
 pub struct GreenNodeData {
+    strong: AtomicUsize,
     data: ReprThin,
 }
 
@@ -54,9 +64,12 @@ impl ToOwned for GreenNodeData {
 
     #[inline]
     fn to_owned(&self) -> GreenNode {
-        let green = unsafe { GreenNode::from_raw(ptr::NonNull::from(self)) };
-        let green = ManuallyDrop::new(green);
-        GreenNode::clone(&green)
+        // A deep, independent copy. `self` is a *shared* borrow, so any owned
+        // `Arc` reconstructed from it would carry provenance narrowed to a
+        // read-only view of the allocation; bumping the refcount and later
+        // deallocating the payload as the last owner is Undefined Behavior under
+        // Tree Borrows. Rebuilding a fresh allocation avoids that entirely.
+        GreenNode::new(self.kind(), self.children().map(|it| it.to_owned()))
     }
 }
 
@@ -110,12 +123,17 @@ impl fmt::Display for GreenNodeData {
 impl GreenNodeData {
     #[inline]
     fn header(&self) -> &GreenNodeHead {
-        &self.data.header
+        &self.data.header.header
     }
 
     #[inline]
     fn slice(&self) -> &[GreenChild] {
-        self.data.slice()
+        let len = self.data.header.length;
+        // `addr_of!` keeps the whole-allocation provenance of `&self` (mirrors
+        // triomphe's own thin-to-fat reconstruction); the trailing `GreenChild`s
+        // live right after the `[GreenChild; 0]` marker in the allocation.
+        let ptr = ptr::addr_of!(self.data.slice) as *const GreenChild;
+        unsafe { slice::from_raw_parts(ptr, len) }
     }
 
     /// Kind of this node.
@@ -186,11 +204,9 @@ impl ops::Deref for GreenNode {
 
     #[inline]
     fn deref(&self) -> &GreenNodeData {
-        let repr: &Repr = &self.ptr;
-        unsafe {
-            let repr: &ReprThin = &*(repr as *const Repr as *const ReprThin);
-            mem::transmute::<&ReprThin, &GreenNodeData>(repr)
-        }
+        // `ThinArc::as_ptr` yields the whole-allocation base pointer; casting it
+        // to `&GreenNodeData` (which mirrors the `ArcInner` layout) is sound.
+        unsafe { &*(self.ptr.as_ptr() as *const GreenNodeData) }
     }
 }
 
@@ -203,45 +219,35 @@ impl GreenNode {
         I::IntoIter: ExactSizeIterator,
     {
         let mut text_len: TextSize = 0.into();
-        let children = children.into_iter().map(|el| {
-            let rel_offset = text_len;
-            text_len += el.text_len();
-            match el {
-                NodeOrToken::Node(node) => GreenChild::Node { rel_offset, node },
-                NodeOrToken::Token(token) => GreenChild::Token { rel_offset, token },
-            }
-        });
+        let children: Vec<GreenChild> = children
+            .into_iter()
+            .map(|el| {
+                let rel_offset = text_len;
+                text_len += el.text_len();
+                match el {
+                    NodeOrToken::Node(node) => GreenChild::Node { rel_offset, node },
+                    NodeOrToken::Token(token) => GreenChild::Token { rel_offset, token },
+                }
+            })
+            .collect();
 
-        let data = ThinArc::from_header_and_iter(
-            GreenNodeHead { kind, text_len: 0.into(), _c: Count::new() },
-            children,
-        );
-
-        // XXX: fixup `text_len` after construction, because we can't iterate
-        // `children` twice.
-        let data = {
-            let mut data = Arc::from_thin(data);
-            Arc::get_mut(&mut data).unwrap().header.text_len = text_len;
-            Arc::into_thin(data)
-        };
-
-        GreenNode { ptr: data }
+        let head = GreenNodeHead { kind, text_len, _c: Count::new() };
+        GreenNode { ptr: ThinArc::from_header_and_iter(head, children.into_iter()) }
     }
 
     #[inline]
     pub(crate) fn into_raw(this: GreenNode) -> ptr::NonNull<GreenNodeData> {
-        let green = ManuallyDrop::new(this);
-        let green: &GreenNodeData = &green;
-        ptr::NonNull::from(green)
+        // `ThinArc::into_raw` hands back the whole-allocation base pointer
+        // without changing the refcount.
+        let raw = ThinArc::into_raw(this.ptr);
+        unsafe { ptr::NonNull::new_unchecked(raw as *mut GreenNodeData) }
     }
 
     #[inline]
     pub(crate) unsafe fn from_raw(ptr: ptr::NonNull<GreenNodeData>) -> GreenNode {
-        unsafe {
-            let arc = Arc::from_raw(&ptr.as_ref().data as *const ReprThin);
-            let arc = mem::transmute::<Arc<ReprThin>, ThinArc<GreenNodeHead, GreenChild>>(arc);
-            GreenNode { ptr: arc }
-        }
+        // `ptr` is a whole-allocation base pointer produced by `into_raw`.
+        let ptr = unsafe { ThinArc::from_raw(ptr.as_ptr() as *const c_void) };
+        GreenNode { ptr }
     }
 }
 
