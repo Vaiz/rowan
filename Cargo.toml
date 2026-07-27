@@ -20,6 +20,7 @@ hashbrown = { version = "0.15.2", features = [
 ], default-features = false }
 text-size = "1.1.1"
 countme = "3.0.1"
+triomphe = { version = "0.1.16", default-features = false, features = ["std"] }
 
 serde = { version = "1.0.218", optional = true, default-features = false }
 
